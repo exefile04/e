@@ -1,0 +1,21 @@
+# Private data - never commit
+data.json
+secret.key
+sessions.json
+library_data.xlsx
+activity_log.xlsx
+activity_log.jsonl
+library_logins_*.xlsx
+seed.json
+*.bak
+*.log
+ 
+# Dev leftovers
+node_modules/
+patch*.py
+library.v*.html
+.env
+.DS_Store
+library.orig.html
+server.v*.js
+logins.xlsx
