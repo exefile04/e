@@ -1,5 +1,9 @@
 # Private data - never commit
 data.json
+data.json.old
+staff.json
+library_data.unsaved.xlsx
+*.tmp
 secret.key
 sessions.json
 library_data.xlsx
@@ -9,7 +13,7 @@ library_logins_*.xlsx
 seed.json
 *.bak
 *.log
- 
+
 # Dev leftovers
 node_modules/
 patch*.py

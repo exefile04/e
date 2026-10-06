@@ -1,17 +1,20 @@
 // Kutubxona library server. Run: node server.js   (Node 18+, no npm install needed)
-// Serves library.html and a small API. Passwords are stored hashed (scrypt) and never sent to browsers.
-// Every change is saved to data.json AND to two Excel files next to this script:
-//   library_data.xlsx   - all library data (members, books, copies, loans, requests, queues, assignments, ...)
-//   activity_log.xlsx   - every action (logins, issues, returns, profile updates, assignments, ...)
-// Start options:
-//   node server.js --from-excel            load everything from library_data.xlsx (e.g. after editing it in Excel)
-//   node server.js --restore-from-seed     reset non-admin passwords to the ones in seed.json
+// The code holds NO library data. Everything lives in files next to this script:
+//   library_data.xlsx   - THE database: members, books, copies, loans, requests, queues, assignments, ...
+//                         Read at start, saved again after every change, and re-read automatically when
+//                         someone edits and saves it in Excel while the server is running.
+//   staff.json          - admin and librarian logins only (kept out of the Excel file)
+//   activity_log.xlsx   - every action (logins, issues, returns, edits, ...), plus activity_log.jsonl
+//   secret.key          - key for the readable password copies. Back it up together with the Excel file.
+// To start a new library, put a members list in library_data.xlsx (columns: Role, First name, Last name,
+// Class / subject, House, Username, Password - Username and Password may be left empty) and start the server.
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 const PORT = process.env.PORT || 3000;
-const SEED = path.join(__dirname, 'seed.json'), DB = path.join(__dirname, 'data.json'), PAGE = path.join(__dirname, 'library.html');
-const XD = path.join(__dirname, 'library_data.xlsx'), XL = path.join(__dirname, 'activity_log.xlsx'), LJ = path.join(__dirname, 'activity_log.jsonl');
+const DB = path.join(__dirname, 'data.json'), PAGE = path.join(__dirname, 'library.html'), STF = path.join(__dirname, 'staff.json');
+const XD = path.join(__dirname, 'library_data.xlsx'), XP = path.join(__dirname, 'library_data.unsaved.xlsx'), XL = path.join(__dirname, 'activity_log.xlsx'), LJ = path.join(__dirname, 'activity_log.jsonl');
 const ROLES = ['admin', 'librarian', 'teacher', 'staff', 'student'];
-const staff = u => !!u && (u.role === 'admin' || u.role === 'librarian');
+const staff = u => !!u && (u.role === 'admin' || u.role === 'librarian'), SR = r => r === 'admin' || r === 'librarian';
+const ADM0 = () => ({ id: 'a1', role: 'admin', f: 'Admin', l: '', c: '', u: 'admin', p: 'admin' });
 
 const hash = p => { const s = crypto.randomBytes(16).toString('hex'); return 'scrypt$' + s + '$' + crypto.scryptSync(p, s, 32).toString('hex'); };
 const check = (p, h) => { const [, s, x] = String(h).split('$'); if (!x) return false; const a = Buffer.from(x, 'hex'), b = crypto.scryptSync(p, s, 32); return a.length === b.length && crypto.timingSafeEqual(a, b); };
@@ -44,7 +47,9 @@ const uniqU = (b, taken) => { if (!taken.has(b)) return b; for (let i = 1; ; i++
 let D = null;
 const loadJSON = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 let DREV = 1, LREV = 1;   // change counters: browsers only download the state again when something changed
-const persist = () => { fs.writeFileSync(DB + '.tmp', JSON.stringify(D)); fs.renameSync(DB + '.tmp', DB); DREV++; queueX('data'); };   // write then rename, so a crash never leaves a broken file
+// staff.json: admin + librarian accounts only (write then rename, so a crash never leaves a broken file)
+const saveStaff = () => { const t = JSON.stringify({ ms: D.ms.filter(m => SR(m.role)) }, null, 1); if (t === saveStaff.last) return; fs.writeFileSync(STF + '.tmp', t, { mode: 0o600 }); fs.renameSync(STF + '.tmp', STF); saveStaff.last = t; };
+const persist = () => { DREV++; saveStaff(); queueX('data'); };   // every change: staff.json now, library_data.xlsx a moment later
 
 // ---------- activity log (kept in activity_log.jsonl + activity_log.xlsx; the server writes it, browsers cannot change it)
 let LOG = [];
@@ -190,14 +195,14 @@ function readXlsx(buf) {
 // ---------- library_data.xlsx: what each sheet holds
 const J = o => { const k = Object.keys(o).filter(x => o[x] !== undefined); return k.length ? JSON.stringify(Object.fromEntries(k.map(x => [x, o[x]]))) : ''; };
 const yn = b => b ? 'yes' : '';
-function dataSheets() {
-  const title = id => ((D.bs.find(b => b.id === id) || {}).t) || '', mm = new Map(D.ms.map(m => [m.id, m]));
-  const covers = D.bs.filter(b => b.img).map(b => [b.id, ...String(b.img).match(/[\s\S]{1,32000}/g)]), cw = Math.max(1, ...covers.map(r => r.length - 1));
-  const { ms, bs, loans, rq, qs, as, nt, log, ...meta } = D;
+function dataSheets(d = D) {
+  const bm = new Map(d.bs.map(b => [b.id, b])), title = id => (bm.get(id) || {}).t || '', mm = new Map(d.ms.map(m => [m.id, m]));
+  const covers = d.bs.filter(b => b.img).map(b => [b.id, ...String(b.img).match(/[\s\S]{1,32000}/g)]), cw = Math.max(1, ...covers.map(r => r.length - 1));
+  const { ms, bs, loans, rq, qs, as, nt, log, xr, ...meta } = d;   // xr only lives in memory
   return [
     {
-      name: 'Members', cols: [['ID', 10], ['Role', 10], ['First name', 16], ['Last name', 18], ['Class / subject', 14], ['House', 20], ['Join year', 10, 'n'], ['Username', 24], ['Previous username', 26], ['Password hash', 20], ['Password (encrypted)', 20], ['Other (JSON)', 20]],
-      rows: ms.map(({ id, role, f, l, c, hs, jy, u, ou, p, pe, ...x }) => [id, role, f, l, c, hs, jy === undefined ? '' : +jy, u, ou, p, pe, J(x)])
+      name: 'Members', cols: [['ID', 10], ['Role', 10], ['First name', 16], ['Last name', 18], ['Class / subject', 14], ['House', 20], ['Join year', 10, 'n'], ['Username', 24], ['New password (type to change)', 18], ['Previous username', 26], ['Graduated (year)', 10, 'n'], ['Password hash', 20], ['Password (encrypted)', 20], ['Other (JSON)', 20]],
+      rows: ms.filter(m => !SR(m.role)).map(({ id, role, f, l, c, hs, jy, u, ou, gr, gc, p, pe, ...x }) => [id, role, f, l, gr ? gc || c : c, hs, jy === undefined ? '' : +jy, u, '', ou, gr ? +gr : '', p, pe, J(x)])
     },
     {
       name: 'Books', cols: [['Book ID', 10], ['Title', 32], ['Title (Cyrillic)', 26], ['Author', 24], ['Author (Cyrillic)', 22], ['Language', 10], ['Copies', 8, 'n'], ['Available', 9, 'n'], ['Book of the Week', 9], ['Book of the Month', 9], ['Has cover', 8], ['Other (JSON)', 16]],
@@ -236,6 +241,7 @@ const logSheets = () => [{
 }];   // newest first
 
 // rebuilds the library from library_data.xlsx (also accepts members/books typed in by hand)
+const NORM = { n: 0 };   // counts things the reader had to fill in (IDs, usernames, typed passwords): then the file is saved again
 function dataFromExcel(buf) {
   const S = readXlsx(buf), g = n => S[n] || [], str = v => v === undefined || v === null ? '' : String(v).trim(), opt = v => str(v) || undefined;
   const dt = v => { if (typeof v === 'number' && isFinite(v) && v > 0) return fromSer(v); const m = /^(\d{1,2})[./](\d{1,2})[./](\d{4})(?:[ ,T]+(\d{1,2}):(\d{2}))?/.exec(str(v)); return m ? new Date(+m[3], m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0)).getTime() : undefined; };
@@ -243,15 +249,23 @@ function dataFromExcel(buf) {
   const rid = () => crypto.randomBytes(4).toString('hex'), yes = v => v === true || /^(yes|y|true|1|ha|да)$/i.test(str(v));
   const out = { ms: [], bs: [], loans: [], qs: {}, as: [], rq: [], nt: [] };
   g('Settings').forEach(r => { const k = str(r['Key']); if (k && !(k in out)) { try { out[k] = JSON.parse(str(r['Value (JSON)'])); } catch (e) { } } });
-  g('Members').forEach(r => {
-    const role = ROLES.includes(str(r['Role']).toLowerCase()) ? str(r['Role']).toLowerCase() : 'student', jy = parseInt(r['Join year']);
-    const m = { id: str(r['ID']) || rid(), role, f: str(r['First name']), l: str(r['Last name']), c: str(r['Class / subject']), ...js(r['Other (JSON)']) };
-    if (str(r['House'])) m.hs = str(r['House']); if (jy > 1990) m.jy = jy; if (str(r['Previous username'])) m.ou = str(r['Previous username']);
-    m.u = str(r['Username']); m.p = str(r['Password hash']) || str(r['Password']) || crypto.randomBytes(4).toString('hex'); if (str(r['Password (encrypted)'])) m.pe = str(r['Password (encrypted)']);
+  const msh = S['Members'] || Object.values(S).find(rows => rows.length && 'First name' in rows[0] && 'Last name' in rows[0]) || [];
+  const col = (r, ...ks) => { for (const k of ks) if (str(r[k])) return str(r[k]); return ''; };
+  msh.forEach(r => {
+    const rl = col(r, 'Role').toLowerCase(), role = ROLES.includes(rl) ? rl : 'student', jy = parseInt(col(r, 'Join year', 'Year joined'));
+    let c = col(r, 'Class / subject', 'Class', 'Class/subject', 'Subject'), gr = parseInt(col(r, 'Graduated (year)'));
+    const gm = /^graduated\s*(\d{4})$/i.exec(c); if (gm) { gr = +gm[1]; c = ''; }
+    const m = { id: col(r, 'ID') || (NORM.n++, rid()), role, f: col(r, 'First name'), l: col(r, 'Last name'), c, ...js(r['Other (JSON)']) };
+    if (gr > 1990) { m.gr = gr; m.gc = c; m.c = ''; }
+    if (col(r, 'House')) m.hs = col(r, 'House'); if (jy > 1990) m.jy = jy; const ou = col(r, 'Previous username', 'Old username'); if (ou) m.ou = ou;
+    m.u = col(r, 'Username');
+    const np = nows(col(r, 'New password (type to change)', 'Password')), ph = col(r, 'Password hash');
+    if (np) { m.p = np; NORM.n++; } else if (ph) { m.p = ph; if (col(r, 'Password (encrypted)')) m.pe = col(r, 'Password (encrypted)'); if (!ph.startsWith('scrypt$')) NORM.n++; }
+    else { m.p = crypto.randomBytes(3).toString('hex'); NORM.n++; }
     if (m.f || m.u) out.ms.push(m);
   });
   const taken = new Set(out.ms.filter(m => m.u).map(m => N2(m.u)));
-  out.ms.forEach(m => { if (!m.u) { if (m.role === 'student' && !m.jy) m.jy = joinYear(m.c, Date.now()); m.u = uniqU(baseU(m), taken); taken.add(m.u); } });
+  out.ms.forEach(m => { if (!m.u) { NORM.n++; if (m.role === 'student' && !m.jy) m.jy = joinYear(m.gc || m.c, Date.now()); m.u = uniqU(baseU(m), taken); taken.add(m.u); } });
   g('Loans').forEach(r => { const l = { id: str(r['Loan ID']) || rid(), b: str(r['Book ID']), t: opt(r['Title']), lib: str(r['Library ID']), isbn: str(r['ISBN']), m: str(r['Member ID']), who: str(r['Member']), u: str(r['Username']), iss: dt(r['Issued']), due: dt(r['Due']), ...js(r['Other (JSON)']) }; const ret = dt(r['Returned']); if (ret) l.ret = ret; if (+r['Renewals']) l.rn = +r['Renewals']; if (l.b && l.m) out.loans.push(l); });
   const covers = {}; g('Covers').forEach(r => { const id = str(r['Book ID']); if (id) covers[id] = Object.keys(r).filter(k => /^Image part/.test(k)).sort((a, b) => parseInt(a.slice(11)) - parseInt(b.slice(11))).map(k => str(r[k])).join(''); });
   const cps = {}; g('Copies').forEach(r => { const id = str(r['Book ID']); if (id) (cps[id] = cps[id] || []).push({ n: +r['Copy no.'] || 0, lib: str(r['Library ID']), isbn: str(r['ISBN']), out: str(r['On loan (loan ID)']) || null }); });
@@ -269,31 +283,45 @@ function dataFromExcel(buf) {
   g('Queues').sort((a, b) => (+a['Position'] || 0) - (+b['Position'] || 0)).forEach(r => { const b = str(r['Book ID']), m = str(r['Member ID']); if (b && m) (out.qs[b] = out.qs[b] || []).push(m); });
   g('Assignments').forEach(r => { const a = { id: str(r['ID']) || rid(), b: str(r['Book ID']), cl: str(r['Classes']).split(/\s*,\s*/).filter(Boolean), from: dt(r['From']), to: dt(r['To']), lab: str(r['Period']) || 'Custom range', by: str(r['By (member ID)']), ...js(r['Other (JSON)']) }; if (a.b && a.cl.length && a.from && a.to) out.as.push(a); });
   g('Notifications').forEach(r => { const x = { id: str(r['ID']) || rid(), m: str(r['Member ID']), k: str(r['Type']), b: str(r['Book']), t: dt(r['Time']) || Date.now(), ...js(r['Other (JSON)']) }; if (yes(r['Read'])) x.r = 1; if (x.m) out.nt.push(x); });
-  if (!out.ms.some(m => m.role === 'admin')) out.ms.unshift({ id: 'a1', role: 'admin', f: 'Admin', l: '', c: '', u: 'admin', p: 'admin' });
   return out;
 }
 
 // write the Excel files shortly after each change (if a file is open in Excel and locked, retry until it is closed)
 const XQ = {}, XW = {};
 function queueX(kind) { clearTimeout(XQ[kind]); XQ[kind] = setTimeout(() => writeX(kind), 300); }
+let MINE = null, BASEBUF = null;   // BASEBUF: the file as this server last wrote/read it (used to merge hand edits)
+let MINE_ = 0;   // size+time of the last library_data.xlsx this server wrote (so our own saves are not "re-read")
+const stamp = f => { try { const t = fs.statSync(f); return t.size + ':' + t.mtimeMs; } catch (e) { return null; } };
 function writeX(kind) {
-  const f = kind === 'data' ? XD : XL;
-  try { const buf = xlsx(kind === 'data' ? dataSheets() : logSheets()); fs.writeFileSync(f + '.tmp', buf); fs.renameSync(f + '.tmp', f); if (XW[kind]) { console.log('Saved ' + path.basename(f) + ' again.'); XW[kind] = 0; } }
-  catch (e) { if (!XW[kind]) console.warn('Could not save ' + path.basename(f) + ' (' + e.code + '). If it is open in Excel, close it; retrying every 10 s. data.json is still saved.'); XW[kind] = 1; try { fs.unlinkSync(f + '.tmp'); } catch (x) { } clearTimeout(XQ[kind]); XQ[kind] = setTimeout(() => writeX(kind), 1e4); }
+  clearTimeout(XQ[kind]); XQ[kind] = 0;
+  const f = kind === 'data' ? XD : XL; let buf;
+  try { buf = xlsx(kind === 'data' ? dataSheets() : logSheets()); fs.writeFileSync(f + '.tmp', buf); fs.renameSync(f + '.tmp', f); if (kind === 'data') { MINE = stamp(XD); BASEBUF = buf; try { fs.unlinkSync(XP); } catch (x) { } } if (XW[kind]) { console.log('Saved ' + path.basename(f) + ' again.'); XW[kind] = 0; } }
+  catch (e) {
+    try { fs.unlinkSync(f + '.tmp'); } catch (x) { }
+    if (kind === 'data' && buf) try { fs.writeFileSync(XP, buf); } catch (x) { }   // nothing is lost while Excel keeps the file locked
+    if (!XW[kind]) console.warn('Could not save ' + path.basename(f) + ' (' + e.code + '). If it is open in Excel, close it; retrying every 10 s.' + (kind === 'data' ? ' The changes are kept in ' + path.basename(XP) + ' meanwhile.' : ''));
+    XW[kind] = 1; XQ[kind] = setTimeout(() => writeX(kind), 1e4);
+  }
 }
+const flush = () => { for (const k of ['data', 'log']) if (XQ[k]) writeX(k); };
+for (const sg of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sg, () => { flush(); process.exit(0); });
 
 // ---------- load data
-const FROMX = process.argv.includes('--from-excel');
-let src;
+let src, rd = '';
 try {
-  if (FROMX && fs.existsSync(XD)) { D = dataFromExcel(fs.readFileSync(XD)); src = 'library_data.xlsx'; }
-  else if (fs.existsSync(DB)) { D = loadJSON(DB); src = 'data.json'; }
-  else if (fs.existsSync(XD)) { D = dataFromExcel(fs.readFileSync(XD)); src = 'library_data.xlsx (data.json was missing)'; }
-  else if (fs.existsSync(SEED)) { D = loadJSON(SEED); src = 'seed.json'; }
-} catch (e) { console.error('Could not read ' + (FROMX ? 'library_data.xlsx' : 'data.json') + ':', e.message); process.exit(1); }
-if (FROMX && !fs.existsSync(XD)) console.warn('--from-excel: library_data.xlsx not found, using ' + src + '.');
-D = D || { ms: [{ id: 'a1', role: 'admin', f: 'Admin', l: '', c: '', u: 'admin', p: 'admin' }] }; src = src || 'defaults';
+  const mt = f => fs.statSync(f).mtimeMs;
+  if (fs.existsSync(XP) && (!fs.existsSync(XD) || mt(XP) > mt(XD))) { rd = XP; src = path.basename(XP) + ' (changes that could not be saved into library_data.xlsx last time)'; }
+  else if (fs.existsSync(XD) && !(fs.existsSync(DB) && mt(DB) > mt(XD) + 5000)) { rd = XD; src = 'library_data.xlsx'; }   // an older version's data.json wins only if it is newer
+  if (rd) { BASEBUF = fs.readFileSync(rd); D = dataFromExcel(BASEBUF); }
+  else if (fs.existsSync(DB)) { D = loadJSON(DB); src = 'data.json (older version) - moved into library_data.xlsx'; }   // one-time move from the old storage
+} catch (e) { console.error('Could not read ' + (rd ? path.basename(rd) : 'data.json') + ':', e.message, '\nFix or remove the file and start again.'); process.exit(1); }
+D = D || { ms: [] }; src = src || 'nothing (new empty library)';
 ['ms', 'bs', 'loans', 'as', 'rq', 'nt'].forEach(k => { if (!Array.isArray(D[k])) D[k] = []; }); if (!D.qs || typeof D.qs !== 'object') D.qs = {};
+{ // admin + librarian accounts come from staff.json; staff rows found in an older Excel/data.json move there
+  let sf = null; try { sf = loadJSON(STF).ms.filter(m => m && SR(m.role)); } catch (e) { }
+  if (sf) D.ms = [...sf, ...D.ms.filter(m => !SR(m.role) && !sf.some(s => s.id === m.id))];
+  if (!D.ms.some(m => m.role === 'admin')) { D.ms.unshift(ADM0()); console.log('No admin account found: created admin / admin. Change the password after logging in!'); }
+}
 try { LOG = fs.readFileSync(LJ, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch (e) { } }).filter(Boolean); }
 catch (e) {   // no log file yet: take the history from activity_log.xlsx if there is one
   try { if (fs.existsSync(XL)) { const K = Object.fromEntries(Object.entries(LL).map(([k, v]) => [v, k])); LOG = (readXlsx(fs.readFileSync(XL))['Activity log'] || []).map(r => ({ t: typeof r['Time'] === 'number' ? fromSer(r['Time']) : Date.now(), by: String(r['User'] || ''), bu: String(r['Username'] || ''), role: String(r['Role'] || ''), k: K[r['Action']] || String(r['Action'] || ''), a: String(r['Item'] || ''), b: String(r['Details'] || '') })).reverse(); fs.writeFileSync(LJ, LOG.map(x => JSON.stringify(x)).join('\n') + (LOG.length ? '\n' : '')); } } catch (x) { console.warn('Could not read activity_log.xlsx:', x.message); }
@@ -305,25 +333,17 @@ if (Array.isArray(D.log) && D.log.length) {   // older versions kept a short log
 delete D.log;
 
 const hashAsync = p => new Promise((ok, no) => { const s = crypto.randomBytes(16).toString('hex'); crypto.scrypt(p, s, 32, (e, k) => e ? no(e) : ok('scrypt$' + s + '$' + k.toString('hex'))); });
-async function securePasswords() {   // hash plaintext seeds once; give every member an encrypted copy so the admin can view it
-  const FORCE = process.argv.includes('--restore-from-seed');   // node server.js --restore-from-seed : reset passwords to the ones in seed.json
-  let seedPw = {}; try { loadJSON(SEED).ms.forEach(m => { if (m.p && !String(m.p).startsWith('scrypt$')) { seedPw['id:' + m.id] = nows(m.p); seedPw['u:' + N2(m.u)] = nows(m.p); } }); } catch (e) { }
-  const seedOf = m => seedPw['u:' + N2(m.u)] || (m.ou && seedPw['u:' + N2(m.ou)]) || seedPw['id:' + m.id];   // match by username first (ids may differ between seed.json and data.json)
-  const forced = m => FORCE && m.role !== 'admin' && seedOf(m);   // restore never touches admin accounts
-  const todo = D.ms.filter(m => !String(m.p).startsWith('scrypt$') || !m.pe || dec(m.pe) === undefined || forced(m));   // also redo copies that cannot be decrypted
-  if (keyNew) console.log('NOTE: a new secret.key was created. Keep it next to data.json (back it up!).');
-  if (!todo.length) { console.log('Readable passwords: ' + D.ms.length + ' of ' + D.ms.length); return; }
-  console.log('Securing ' + todo.length + ' passwords, please wait a few seconds...');
-  let lost = [];
+async function securePasswords() {   // hash typed-in passwords; give each an encrypted copy so the admin can view it
+  const todo = D.ms.filter(m => !String(m.p).startsWith('scrypt$') || (m.pe && dec(m.pe) === undefined));   // typed-in passwords, or copies made with another secret.key
+  if (keyNew && D.ms.some(m => m.pe)) console.log('NOTE: secret.key was missing, so a new one was created. Readable password copies made with the old key cannot be shown.');
+  if (!todo.length) return false;
   await Promise.all(todo.map(async m => {
-    const sp = seedOf(m);
-    if (forced(m)) { m.p = await hashAsync(sp); m.pe = enc(sp); }
-    else if (!String(m.p).startsWith('scrypt$')) { const pw = nows(m.p); m.p = await hashAsync(pw); m.pe = enc(pw); }
-    else if (sp && check(sp, m.p)) { m.pe = enc(sp); }   // password unchanged since seeding
-    else { delete m.pe; lost.push(m.u); }
+    if (!String(m.p).startsWith('scrypt$')) { const pw = nows(m.p); m.p = await hashAsync(pw); m.pe = enc(pw); }
+    else delete m.pe;
   }));
-  persist();
-  console.log('Readable passwords: ' + D.ms.filter(m => m.pe && dec(m.pe) !== undefined).length + ' of ' + D.ms.length + '.' + (lost.length ? ' Could NOT recover ' + lost.length + ' (they are not in seed.json or their password was changed; in the admin panel use the "Give readable passwords" button): ' + lost.slice(0, 5).join(', ') + (lost.length > 5 ? ', ...' : '') + '.' : ''));
+  const lost = D.ms.filter(m => !m.pe).length;
+  if (lost) console.log(lost + ' members have no readable password copy (in the admin panel use "Give readable passwords" to give them new ones).');
+  return true;
 }
 function migrateUsernames() {   // one time: switch students to the new username format. Old usernames keep working for login.
   if (D.unv >= 2) return;
@@ -360,7 +380,49 @@ function promoteClasses() {
   addLog(null, 'l_promo', up + ' students moved up a grade, ' + grad + ' graduated (' + D.promo + ')', ex.join('; ') + (up + grad > ex.length ? '; ...' : ''));
   console.log('New school year ' + D.promo + ': ' + up + ' students moved up, ' + grad + ' graduated.');
 }
-setInterval(() => { try { promoteClasses(); } catch (e) { console.error('Class promotion failed:', e); } }, 36e5).unref();   // checked every hour, so a server left running also promotes
+// ---------- someone edited library_data.xlsx (e.g. in Excel) while the server runs: load it
+let XR = 0;
+// 3-way merge: base = the file as we last wrote it, ours = the site's data now, theirs = the file just saved in Excel.
+// A record changed only in Excel takes the Excel version; one changed on the site (not yet saved) keeps the site version.
+function merge3(B, O, On, T) {
+  const ix = a => new Map(a.map(x => [x.id, x])), b = ix(B), o = ix(O), on = ix(On), t = ix(T), out = [], seen = new Set();
+  for (const id of [...t.keys(), ...o.keys(), ...b.keys()]) {
+    if (seen.has(id)) continue; seen.add(id);
+    const ours = b.has(id) ? !on.has(id) || !same(on.get(id), b.get(id)) : o.has(id);
+    const x = ours ? o.get(id) : t.get(id); if (x) out.push(x);
+  }
+  return out;
+}
+function reloadExcel(tries = 0) {
+  let T, buf;
+  try { buf = fs.readFileSync(XD); NORM.n = 0; T = dataFromExcel(buf); }
+  catch (e) { if (tries < 5) return setTimeout(() => reloadExcel(tries + 1), 1500); console.warn('library_data.xlsx changed but could not be read (' + e.message + '). Keeping the current data.'); return; }
+  const filled = NORM.n;
+  let B; try { B = BASEBUF ? dataFromExcel(BASEBUF) : null; } catch (e) { B = null; }
+  const On = dataFromExcel(xlsx(dataSheets()));   // the site's data in the same shape as read from a file
+  B = B || On;
+  const norm = d => { for (const k of ['ms', 'bs', 'loans', 'as', 'rq', 'nt']) if (!Array.isArray(d[k])) d[k] = []; if (!d.qs || typeof d.qs !== 'object') d.qs = {}; d.ms = d.ms.filter(m => !SR(m.role)); return d; };
+  [T, B].forEach(norm); norm(On);
+  const st = D.ms.filter(m => SR(m.role)), n = {};
+  for (const k of ['bs', 'loans', 'as', 'rq', 'nt']) n[k] = merge3(B[k], D[k], On[k], T[k]);
+  n.ms = [...st, ...merge3(B.ms, D.ms.filter(m => !SR(m.role)), On.ms, T.ms).filter(m => !SR(m.role) && !st.some(s => s.id === m.id))];
+  n.qs = {}; for (const k of new Set([...Object.keys(T.qs), ...Object.keys(D.qs)])) { const v = same(On.qs[k], B.qs[k]) ? T.qs[k] : D.qs[k]; if (v && v.length) n.qs[k] = v; }
+  const meta = x => Object.keys(x).filter(k => !['ms', 'bs', 'loans', 'as', 'rq', 'nt', 'qs', 'log', 'xr'].includes(k));
+  for (const k of new Set([...meta(T), ...meta(D)])) n[k] = same(On[k], B[k]) ? T[k] : D[k];
+  n.unv = D.unv; n.promo = D.promo; n.xr = (D.xr || 0) + 1; delete n.log;
+  const act = new Set(n.loans.filter(l => !l.ret).map(l => l.id));   // copies point only at loans that are still open
+  n.bs.forEach(b => { (b.copies || []).forEach(c => { if (c.out && !act.has(c.out)) c.out = null; }); b.tot = (b.copies || []).length; b.av = (b.copies || []).filter(c => !c.out).length; });
+  const old = D; D = n; BASEBUF = buf;
+  securePasswords().then(ch => {
+    try { diffLog(old, D, { f: 'Excel file', l: '', u: 'library_data.xlsx', role: 'system', id: '' }, new Set()); } catch (e) { }
+    addLog(null, 'l_sys', 'library_data.xlsx was edited and loaded again', D.ms.filter(m => !SR(m.role)).length + ' members, ' + D.bs.length + ' books');
+    DREV++; saveStaff();
+    const back = dataFromExcel(xlsx(dataSheets()));
+    if (ch || filled || !same(norm(back), T)) queueX('data');   // site changes kept, or IDs/usernames/passwords filled in: write them into the file
+    console.log('library_data.xlsx changed: loaded again (' + D.ms.filter(m => !SR(m.role)).length + ' members, ' + D.bs.length + ' books).');
+  });
+}
+
 const view = u => ({ ...D, ms: D.ms.map(({ p, pe, ...m }) => { const can = u.role === 'admin' || m.id === u.id || (u.role === 'librarian' && m.role !== 'admin'); const pl = pe && can ? dec(pe) : undefined; return pl === undefined ? m : { ...m, p: pl }; }), log: staff(u) ? LOG.slice(-1000).reverse() : [] });   // never expose hashes; plaintext only to admin / librarian (not admin passwords) / the owner
 const SF = path.join(__dirname, 'sessions.json'), fails = {};      // login failures, counted per IP + username (a whole school can share one IP)
 const ipOf = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
@@ -412,7 +474,7 @@ function apply(n, u) {
   });
   const names = n.ms.map(m => N2(m.u));
   if (names.some(u => !u) || new Set(names).size < names.length) return false;
-  delete n.log; n.unv = D.unv; n.promo = D.promo;
+  delete n.log; n.unv = D.unv; n.promo = D.promo; n.xr = D.xr;
   try { diffLog(D, n, u, pwIds); } catch (e) { console.error('Activity log error:', e); }
   D = n; persist(); return true;
 }
@@ -467,7 +529,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'PUT' && url === '/api/state') {
       const { state } = await body(req);
-      if (state && D.promo !== undefined && (state.promo || 0) < D.promo) return send(res, 412, { error: 'stale: the school year changed, reload' });   // a page still showing last year's classes must not undo the promotion
+      if (state && ((D.promo !== undefined && (state.promo || 0) < D.promo) || (state.xr || 0) < (D.xr || 0))) return send(res, 412, { error: 'stale: reload' });   // a page still showing old data (before a new school year or an Excel edit) must not undo it
       if (!allowed(u, state)) return send(res, 403, { error: 'not allowed' });
       if (!apply(state, actor)) return send(res, 409, { error: 'usernames must be unique' });
       return send(res, 200, full(D.ms.find(m => m.id === u.id) || u));
@@ -481,4 +543,18 @@ const server = http.createServer(async (req, res) => {
     send(res, 404, { error: 'not found' });
   } catch (e) { send(res, 400, { error: 'bad request' }); }
 });
-securePasswords().then(() => { migrateUsernames(); promoteClasses(); if (src.startsWith('library_data.xlsx')) { persist(); addLog(null, 'l_sys', 'Library loaded from ' + src, D.ms.length + ' members, ' + D.bs.length + ' books'); } writeX('data'); writeX('log'); server.listen(PORT, () => console.log('Library running at http://localhost:' + PORT + '  (' + D.ms.length + ' members, ' + D.bs.length + ' books loaded from ' + src + ')  Excel files: library_data.xlsx, activity_log.xlsx' + (D.ms.some(m => m.role === 'admin' && m.pe && dec(m.pe) === 'admin') ? '\nWARNING: the admin password is still "admin". Change it in the Profile page!' : ''))); }).catch(e => { console.error('Startup failed:', e); process.exit(1); });
+function started() {   // only once this server owns the port (a second copy started by mistake changes nothing)
+  migrateUsernames(); promoteClasses(); saveStaff();
+  addLog(null, 'l_sys', 'Library loaded from ' + src, D.ms.filter(m => !SR(m.role)).length + ' members, ' + D.bs.length + ' books');
+  writeX('data'); writeX('log');
+  if (fs.existsSync(DB) && !XW.data) { try { fs.renameSync(DB, DB + '.old'); console.log('data.json is no longer used: renamed to data.json.old (delete it once everything looks right).'); } catch (e) { } }
+  fs.watchFile(XD, { interval: 1500 }, () => {
+    const s = stamp(XD); if (!s || s === MINE) return;   // our own save, or the file was removed (it is written again on the next change)
+    MINE = s; clearTimeout(XR); XR = setTimeout(reloadExcel, 700);
+  });
+  setInterval(() => { try { promoteClasses(); } catch (e) { console.error('Class promotion failed:', e); } }, 36e5).unref();   // checked every hour, so a server left running also promotes
+}
+securePasswords().then(() => {
+  server.on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'Port ' + PORT + ' is already in use: the library server is probably already running (close the other window first).' : 'Server error: ' + e.message); process.exit(1); });
+  server.listen(PORT, () => { started(); console.log('Library running at http://localhost:' + PORT + '  (' + D.ms.filter(m => !SR(m.role)).length + ' members, ' + D.bs.length + ' books, ' + D.ms.filter(m => SR(m.role)).length + ' staff logins; loaded from ' + src + ')\nDatabase: library_data.xlsx (edit it in Excel any time, the site picks up the saved file)' + (D.ms.some(m => m.role === 'admin' && m.pe && dec(m.pe) === 'admin') ? '\nWARNING: the admin password is still "admin". Change it in the Profile page!' : '')); });
+}).catch(e => { console.error('Startup failed:', e); process.exit(1); });
